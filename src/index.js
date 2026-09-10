@@ -10,9 +10,8 @@ app.use(express.json());
 // Инициализация БД при запуске
 initDB();
 
-// ==========================================
 // 1. ПРОЕКТЫ
-// ==========================================
+
 
 // Получить проект со всеми задачами и связями
 app.get('/api/projects/:id', async (req, res) => {
@@ -37,7 +36,7 @@ app.get('/api/projects/:id', async (req, res) => {
   }
 });
 
-// СОЗДАТЬ проект (НОВЫЙ ЭНДПОИНТ)
+// СОЗДАТЬ проект 
 app.post('/api/projects', async (req, res) => {
   const { name, start_date, end_date } = req.body;
   console.log(`\n📁 СОЗДАНИЕ ПРОЕКТА:`);
@@ -58,9 +57,7 @@ app.post('/api/projects', async (req, res) => {
   }
 });
 
-// ==========================================
-// 2. ЗАДАЧИ
-// ==========================================
+
 
 // Обновить задачу + КАСКАДНЫЙ СДВИГ
 app.put('/api/tasks/:id', async (req, res) => {
@@ -140,9 +137,7 @@ app.post('/api/tasks/link', async (req, res) => {
   }
 });
 
-// ==========================================
 // 3. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
-// ==========================================
 
 async function cascadeShift(parentId, deltaDays, visited = new Set()) {
   console.log(`  🔍 cascadeShift: ищем детей для родителя ${parentId}`);
@@ -187,10 +182,8 @@ async function cascadeShift(parentId, deltaDays, visited = new Set()) {
   }
 }
 
-// ==========================================
-// 4. ЗАПУСК СЕРВЕРА
-// ==========================================
+
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
-  console.log(`🚀 Сервер запущен на http://localhost:${PORT}`);
+  console.log(` Сервер запущен`);
 });
