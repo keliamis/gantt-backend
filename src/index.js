@@ -7,7 +7,6 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Инициализация БД при запуске
 initDB();
 
 // Главная страница API
@@ -22,7 +21,6 @@ app.get('/', (req, res) => {
 // 1. ПРОЕКТЫ
 // ==========================================
 
-// Получить проект со всеми задачами и связями + автоопределение overdue
 app.get('/api/projects/:id', async (req, res) => {
   try {
     const projectId = req.params.id;
@@ -35,11 +33,12 @@ app.get('/api/projects/:id', async (req, res) => {
       WHERE predecessor_id IN (SELECT id FROM tasks WHERE project_id = $1)
     `, [projectId]);
 
-    // Автоопределение статуса overdue (просрочено)
+    // Автоопределение overdue (ИСПРАВЛЕНО: используем new Date)
     const today = new Date().toISOString().split('T')[0];
     const tasksWithStatus = tasksRes.rows.map(task => {
       let status = task.status;
-      if (task.end_date && task.end_date.split('T')[0] < today && status !== 'done') {
+      const endDateStr = new Date(task.end_date).toISOString().split('T')[0];
+      if (endDateStr < today && status !== 'done') {
         status = 'overdue';
       }
       return { ...task, status };
@@ -55,7 +54,6 @@ app.get('/api/projects/:id', async (req, res) => {
   }
 });
 
-// Создать проект
 app.post('/api/projects', async (req, res) => {
   const { name, start_date, end_date } = req.body;
   console.log(`\n📁 СОЗДАНИЕ ПРОЕКТА:`);
@@ -80,7 +78,6 @@ app.post('/api/projects', async (req, res) => {
 // 2. ЗАДАЧИ
 // ==========================================
 
-// Обновить задачу + КАСКАДНЫЙ СДВИГ + возврат обновлённого проекта
 app.put('/api/tasks/:id', async (req, res) => {
   const taskId = req.params.id;
   const { start_date, end_date, name, status, assignee_id, progress } = req.body;
@@ -119,7 +116,7 @@ app.put('/api/tasks/:id', async (req, res) => {
     if (deltaDays !== 0) {
       console.log(`🚀 ЗАПУСКАЕМ КАСКАДНЫЙ СДВИГ для задачи ${taskId}...`);
       await cascadeShift(taskId, deltaDays);
-      console.log(`🏁 Каскадный сдвиг завершен.`);
+      console.log(` Каскадный сдвиг завершен.`);
     } else {
       console.log(`⏸️ Дельта равна 0, каскад не нужен.`);
     }
@@ -133,11 +130,12 @@ app.put('/api/tasks/:id', async (req, res) => {
       WHERE predecessor_id IN (SELECT id FROM tasks WHERE project_id = $1)
     `, [projectId]);
 
-    // Автоопределение overdue
+    // Автоопределение overdue (ИСПРАВЛЕНО)
     const today = new Date().toISOString().split('T')[0];
     const tasksWithStatus = updatedTasks.rows.map(task => {
       let status = task.status;
-      if (task.end_date && task.end_date.split('T')[0] < today && status !== 'done') {
+      const endDateStr = new Date(task.end_date).toISOString().split('T')[0];
+      if (endDateStr < today && status !== 'done') {
         status = 'overdue';
       }
       return { ...task, status };
@@ -156,7 +154,6 @@ app.put('/api/tasks/:id', async (req, res) => {
   }
 });
 
-// Создать задачу
 app.post('/api/tasks', async (req, res) => {
   const { project_id, name, start_date, end_date, assignee_id } = req.body;
   try {
@@ -170,11 +167,10 @@ app.post('/api/tasks', async (req, res) => {
   }
 });
 
-// Создать связь между задачами + ПРОВЕРКА НА ЦИКЛЫ
+// Создание связи + ПРОВЕРКА НА ЦИКЛЫ
 app.post('/api/tasks/link', async (req, res) => {
   const { predecessor_id, successor_id } = req.body;
   try {
-    // Проверяем, не создаёт ли это циклическую зависимость
     const checkCycle = async (fromId, toId, visited = new Set()) => {
       if (fromId === toId) return true;
       if (visited.has(fromId)) return false;
@@ -204,14 +200,14 @@ app.post('/api/tasks/link', async (req, res) => {
 });
 
 // ==========================================
-// 3. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+// 3. КАСКАДНЫЙ СДВИГ
 // ==========================================
 
 async function cascadeShift(parentId, deltaDays, visited = new Set()) {
-  console.log(`  🔍 cascadeShift: ищем детей для родителя ${parentId}`);
+  console.log(`   cascadeShift: ищем детей для родителя ${parentId}`);
   
   if (visited.has(parentId)) {
-    console.log(`  ️ Задача ${parentId} уже обработана (защита от цикла)`);
+    console.log(`  ⚠️ Задача ${parentId} уже обработана`);
     return;
   }
   visited.add(parentId);
@@ -251,7 +247,7 @@ async function cascadeShift(parentId, deltaDays, visited = new Set()) {
 }
 
 // ==========================================
-// 4. ТЕСТОВЫЕ ДАННЫЕ (ДЛЯ ДЕМО)
+// 4. ТЕСТОВЫЕ ДАННЫЕ
 // ==========================================
 
 app.get('/api/seed', async (req, res) => {
@@ -266,7 +262,7 @@ app.get('/api/seed', async (req, res) => {
 });
 
 // ==========================================
-// 5. ЗАПУСК СЕРВЕРА
+// 5. ЗАПУСК
 // ==========================================
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
