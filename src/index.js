@@ -136,7 +136,16 @@ app.post('/api/tasks/link', async (req, res) => {
     res.status(400).json({ error: 'Такая связь уже существует' });
   }
 });
-
+app.get('/api/seed', async (req, res) => {
+  try {
+    await pool.query(`INSERT INTO projects (name, start_date, end_date) VALUES ('Проект', '2026-09-15', '2026-10-15')`);
+    await pool.query(`INSERT INTO tasks (project_id, name, start_date, end_date) VALUES (1, 'Анализ', '2026-09-15', '2026-09-20'), (1, 'Разработка', '2026-09-21', '2026-10-01'), (1, 'Тестирование', '2026-10-02', '2026-10-10')`);
+    await pool.query(`INSERT INTO task_dependencies (predecessor_id, successor_id) VALUES (1, 2), (2, 3)`);
+    res.json({ success: true, message: 'База заполнена!' });
+  } catch (err) {
+    res.json({ message: 'Уже заполнено или ошибка: ' + err.message });
+  }
+});
 // 3. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 
 async function cascadeShift(parentId, deltaDays, visited = new Set()) {
