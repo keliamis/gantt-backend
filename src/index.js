@@ -260,7 +260,29 @@ app.get('/api/seed', async (req, res) => {
     res.json({ message: 'Уже заполнено или ошибка: ' + err.message });
   }
 });
-
+// Сброс базы к чистым тестовым данным
+app.get('/api/reset', async (req, res) => {
+  try {
+    // Удаляем всё в правильном порядке (сначала зависимости, потом задачи, потом проекты)
+    await pool.query('DELETE FROM task_dependencies');
+    await pool.query('DELETE FROM tasks');
+    await pool.query('DELETE FROM projects');
+    
+    // Сбрасываем счётчики ID
+    await pool.query('ALTER SEQUENCE tasks_id_seq RESTART WITH 1');
+    await pool.query('ALTER SEQUENCE task_dependencies_id_seq RESTART WITH 1');
+    await pool.query('ALTER SEQUENCE projects_id_seq RESTART WITH 1');
+    
+    // Создаём чистые тестовые данные
+    await pool.query(`INSERT INTO projects (name, start_date, end_date) VALUES ('Проект', '2026-09-15', '2026-10-15')`);
+    await pool.query(`INSERT INTO tasks (project_id, name, start_date, end_date) VALUES (1, 'Анализ', '2026-09-15', '2026-09-20'), (1, 'Разработка', '2026-09-21', '2026-10-01'), (1, 'Тестирование', '2026-10-02', '2026-10-10')`);
+    await pool.query(`INSERT INTO task_dependencies (predecessor_id, successor_id) VALUES (1, 2), (2, 3)`);
+    
+    res.json({ success: true, message: 'База сброшена к чистым тестовым данным!' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 // ==========================================
 // 5. ЗАПУСК
 // ==========================================
