@@ -10,10 +10,19 @@ app.use(express.json());
 // Инициализация БД при запуске
 initDB();
 
+// Главная страница API
+app.get('/', (req, res) => {
+  res.json({ 
+    message: "✅ Бэкенд 'Проект под контролем' работает!",
+    docs: "Используй /api/projects/1 для получения данных Ганта"
+  });
+});
+
+// ==========================================
 // 1. ПРОЕКТЫ
+// ==========================================
 
-
-// Получить проект со всеми задачами и связями
+// Получить проект со всеми задачами и связями + автоопределение overdue
 app.get('/api/projects/:id', async (req, res) => {
   try {
     const projectId = req.params.id;
@@ -26,9 +35,19 @@ app.get('/api/projects/:id', async (req, res) => {
       WHERE predecessor_id IN (SELECT id FROM tasks WHERE project_id = $1)
     `, [projectId]);
 
+    // Автоопределение статуса overdue (просрочено)
+    const today = new Date().toISOString().split('T')[0];
+    const tasksWithStatus = tasksRes.rows.map(task => {
+      let status = task.status;
+      if (task.end_date && task.end_date.split('T')[0] < today && status !== 'done') {
+        status = 'overdue';
+      }
+      return { ...task, status };
+    });
+
     res.json({ 
       project: projectRes.rows[0], 
-      tasks: tasksRes.rows, 
+      tasks: tasksWithStatus, 
       dependencies: depsRes.rows 
     });
   } catch (err) {
@@ -36,7 +55,7 @@ app.get('/api/projects/:id', async (req, res) => {
   }
 });
 
-// СОЗДАТЬ проект 
+// Создать проект
 app.post('/api/projects', async (req, res) => {
   const { name, start_date, end_date } = req.body;
   console.log(`\n📁 СОЗДАНИЕ ПРОЕКТА:`);
@@ -57,9 +76,11 @@ app.post('/api/projects', async (req, res) => {
   }
 });
 
+// ==========================================
+// 2. ЗАДАЧИ
+// ==========================================
 
-
-// Обновить задачу + КАСКАДНЫЙ СДВИГ
+// Обновить задачу + КАСКАДНЫЙ СДВИГ + возврат обновлённого проекта
 app.put('/api/tasks/:id', async (req, res) => {
   const taskId = req.params.id;
   const { start_date, end_date, name, status, assignee_id, progress } = req.body;
@@ -70,7 +91,7 @@ app.put('/api/tasks/:id', async (req, res) => {
   console.log(`========================================\n`);
 
   try {
-    const oldTaskRes = await pool.query('SELECT start_date, end_date FROM tasks WHERE id = $1', [taskId]);
+    const oldTaskRes = await pool.query('SELECT start_date, end_date, project_id FROM tasks WHERE id = $1', [taskId]);
     const oldTask = oldTaskRes.rows[0];
 
     if (!oldTask) return res.status(404).json({ error: 'Задача не найдена' });
@@ -103,7 +124,32 @@ app.put('/api/tasks/:id', async (req, res) => {
       console.log(`⏸️ Дельта равна 0, каскад не нужен.`);
     }
 
-    res.json({ success: true, message: 'Задача обновлена, каскад применен' });
+    // Возвращаем обновлённый проект целиком
+    const projectId = oldTask.project_id;
+    const updatedProject = await pool.query('SELECT * FROM projects WHERE id = $1', [projectId]);
+    const updatedTasks = await pool.query('SELECT * FROM tasks WHERE project_id = $1', [projectId]);
+    const updatedDeps = await pool.query(`
+      SELECT predecessor_id, successor_id FROM task_dependencies 
+      WHERE predecessor_id IN (SELECT id FROM tasks WHERE project_id = $1)
+    `, [projectId]);
+
+    // Автоопределение overdue
+    const today = new Date().toISOString().split('T')[0];
+    const tasksWithStatus = updatedTasks.rows.map(task => {
+      let status = task.status;
+      if (task.end_date && task.end_date.split('T')[0] < today && status !== 'done') {
+        status = 'overdue';
+      }
+      return { ...task, status };
+    });
+
+    res.json({ 
+      success: true, 
+      message: 'Задача обновлена, каскад применен',
+      project: updatedProject.rows[0],
+      tasks: tasksWithStatus,
+      dependencies: updatedDeps.rows
+    });
   } catch (err) {
     console.error(`❌ ОШИБКА:`, err);
     res.status(500).json({ error: err.message });
@@ -124,10 +170,30 @@ app.post('/api/tasks', async (req, res) => {
   }
 });
 
-// Создать связь между задачами
+// Создать связь между задачами + ПРОВЕРКА НА ЦИКЛЫ
 app.post('/api/tasks/link', async (req, res) => {
   const { predecessor_id, successor_id } = req.body;
   try {
+    // Проверяем, не создаёт ли это циклическую зависимость
+    const checkCycle = async (fromId, toId, visited = new Set()) => {
+      if (fromId === toId) return true;
+      if (visited.has(fromId)) return false;
+      visited.add(fromId);
+      
+      const deps = await pool.query(
+        'SELECT successor_id FROM task_dependencies WHERE predecessor_id = $1',
+        [fromId]
+      );
+      for (const dep of deps.rows) {
+        if (await checkCycle(dep.successor_id, toId, visited)) return true;
+      }
+      return false;
+    };
+
+    if (await checkCycle(successor_id, predecessor_id)) {
+      return res.status(400).json({ error: 'Создание циклической зависимости запрещено' });
+    }
+
     await pool.query(`
       INSERT INTO task_dependencies (predecessor_id, successor_id) VALUES ($1, $2)
     `, [predecessor_id, successor_id]);
@@ -136,23 +202,16 @@ app.post('/api/tasks/link', async (req, res) => {
     res.status(400).json({ error: 'Такая связь уже существует' });
   }
 });
-app.get('/api/seed', async (req, res) => {
-  try {
-    await pool.query(`INSERT INTO projects (name, start_date, end_date) VALUES ('Проект', '2026-09-15', '2026-10-15')`);
-    await pool.query(`INSERT INTO tasks (project_id, name, start_date, end_date) VALUES (1, 'Анализ', '2026-09-15', '2026-09-20'), (1, 'Разработка', '2026-09-21', '2026-10-01'), (1, 'Тестирование', '2026-10-02', '2026-10-10')`);
-    await pool.query(`INSERT INTO task_dependencies (predecessor_id, successor_id) VALUES (1, 2), (2, 3)`);
-    res.json({ success: true, message: 'База заполнена!' });
-  } catch (err) {
-    res.json({ message: 'Уже заполнено или ошибка: ' + err.message });
-  }
-});
+
+// ==========================================
 // 3. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+// ==========================================
 
 async function cascadeShift(parentId, deltaDays, visited = new Set()) {
   console.log(`  🔍 cascadeShift: ищем детей для родителя ${parentId}`);
   
   if (visited.has(parentId)) {
-    console.log(`  ⚠️ Задача ${parentId} уже обработана (защита от цикла)`);
+    console.log(`  ️ Задача ${parentId} уже обработана (защита от цикла)`);
     return;
   }
   visited.add(parentId);
@@ -191,8 +250,25 @@ async function cascadeShift(parentId, deltaDays, visited = new Set()) {
   }
 }
 
+// ==========================================
+// 4. ТЕСТОВЫЕ ДАННЫЕ (ДЛЯ ДЕМО)
+// ==========================================
 
+app.get('/api/seed', async (req, res) => {
+  try {
+    await pool.query(`INSERT INTO projects (name, start_date, end_date) VALUES ('Проект', '2026-09-15', '2026-10-15')`);
+    await pool.query(`INSERT INTO tasks (project_id, name, start_date, end_date) VALUES (1, 'Анализ', '2026-09-15', '2026-09-20'), (1, 'Разработка', '2026-09-21', '2026-10-01'), (1, 'Тестирование', '2026-10-02', '2026-10-10')`);
+    await pool.query(`INSERT INTO task_dependencies (predecessor_id, successor_id) VALUES (1, 2), (2, 3)`);
+    res.json({ success: true, message: 'База заполнена!' });
+  } catch (err) {
+    res.json({ message: 'Уже заполнено или ошибка: ' + err.message });
+  }
+});
+
+// ==========================================
+// 5. ЗАПУСК СЕРВЕРА
+// ==========================================
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
-  console.log(` Сервер запущен`);
+  console.log(`🚀 Сервер запущен на http://localhost:${PORT}`);
 });
