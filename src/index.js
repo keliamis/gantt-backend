@@ -1331,7 +1331,170 @@ app.use((req, res) => {
 // ======================================================
 // ЗАПУСК
 // ======================================================
+// AI-анализ проекта
+app.get('/api/projects/:id/analyze', async (req, res) => {
+  try {
+    const projectId = req.params.id;
+    
+    // Получаем все задачи проекта
+    const tasksRes = await pool.query(
+      'SELECT * FROM tasks WHERE project_id = $1', 
+      [projectId]
+    );
+    const tasks = tasksRes.rows;
+    
+    // Получаем проект
+    const projectRes = await pool.query(
+      'SELECT * FROM projects WHERE id = $1', 
+      [projectId]
+    );
+    const project = projectRes.rows[0];
+    
+    if (!project) {
+      return res.status(404).json({ error: 'Проект не найден' });
+    }
+    
+    // Анализируем данные
+    const today = new Date();
+    const todayStr = today.toISOString().split('T')[0];
+    
+    // Считаем статистику
+    const totalTasks = tasks.length;
+    const completedTasks = tasks.filter(t => t.status === 'done').length;
+    const overdueTasks = tasks.filter(t => {
+      const endDate = new Date(t.end_date).toISOString().split('T')[0];
+      return endDate < todayStr && t.status !== 'done';
+    }).length;
+    const inProgressTasks = tasks.filter(t => t.status === 'in_progress').length;
+    
+    // Находим критические задачи (те, что влияют на срок проекта)
+    const criticalTasks = tasks.filter(t => {
+      const endDate = new Date(t.end_date);
+      const projectEnd = new Date(project.end_date);
+      return endDate >= projectEnd && t.status !== 'done';
+    });
+    
+    // Определяем основные риски
+    const risks = [];
+    
+    if (overdueTasks > 0) {
+      risks.push({
+        type: 'overdue',
+        severity: 'high',
+        message: `Просрочено задач: ${overdueTasks}`,
+        description: 'Некоторые задачи уже просрочены, что может повлиять на общий срок проекта'
+      });
+    }
+    
+    if (criticalTasks.length > 0) {
+      risks.push({
+        type: 'critical_path',
+        severity: 'medium',
+        message: `Критических задач: ${criticalTasks.length}`,
+        description: 'Эти задачи напрямую влияют на дедлайн проекта'
+      });
+    }
+    
+    const progressPercent = totalTasks > 0 ? Math.round((completedTasks / totalTasks) * 100) : 0;
+    
+    if (progressPercent < 50 && new Date(project.end_date) <= new Date()) {
+      risks.push({
+        type: 'deadline_risk',
+        severity: 'high',
+        message: 'Высокий риск срыва дедлайна',
+        description: `Выполнено только ${progressPercent}% задач до дедлайна`
+      });
+    }
+    
+    // Рекомендации
+    const recommendations = [];
+    
+    if (overdueTasks > 0) {
+      recommendations.push('Срочно займитесь просроченными задачами');
+    }
+    
+    if (inProgressTasks > 3) {
+      recommendations.push('Слишком много задач в работе одновременно. Сфокусируйтесь на завершении.');
+    }
+    
+    if (progressPercent < 30) {
+      recommendations.push('Проект на ранней стадии. Убедитесь, что все ресурсы распределены.');
+    }
+    
+    // Формируем ответ для AI
+    const analysis = {
+      summary: {
+        totalTasks,
+        completedTasks,
+        inProgressTasks,
+        overdueTasks,
+        progressPercent,
+        projectEndDate: project.end_date,
+        daysUntilDeadline: Math.ceil((new Date(project.end_date) - today) / (1000 * 60 * 60 * 24))
+      },
+      risks,
+      recommendations,
+      criticalTasks: criticalTasks.map(t => ({
+        id: t.id,
+        name: t.name,
+        endDate: t.end_date,
+        status: t.status
+      })),
+      // Готовые ответы на вопросы
+      answers: {
+        risks: risks.length > 0 
+          ? risks.map(r => r.message).join('. ') 
+          : 'Пока основных рисков не выявлено. Проект идет по плану.',
+        
+        priorities: recommendations.length > 0
+          ? recommendations.join('. ')
+          : 'Продолжайте работу в текущем режиме.',
+        
+        criticalImpact: criticalTasks.length > 0
+          ? `На срок проекта сильнее всего влияют: ${criticalTasks.map(t => t.name).join(', ')}`
+          : 'Все задачи выполняются в срок, критических задержек нет.'
+      }
+    };
+    
+    res.json(analysis);
+  } catch (err) {
+    console.error('Ошибка анализа проекта:', err);
+    res.status(500).json({ error: 'Ошибка при анализе проекта: ' + err.message });
+  }
+});
 
+// POST-эндпоинт для AI-вопросов (если фронт отправляет вопросы)
+app.post('/api/projects/:id/ask', async (req, res) => {
+  try {
+    const { question } = req.body;
+    const projectId = req.params.id;
+    
+    // Получаем анализ
+    const analysisRes = await fetch(`http://localhost:${process.env.PORT || 3001}/api/projects/${projectId}/analyze`);
+    const analysis = await analysisRes.json();
+    
+    // Простые ответы на основе анализа
+    let answer = '';
+    
+    if (question.includes('риск')) {
+      answer = analysis.answers.risks;
+    } else if (question.includes('приоритет') || question.includes('делать')) {
+      answer = analysis.answers.priorities;
+    } else if (question.includes('влияют') || question.includes('срок')) {
+      answer = analysis.answers.criticalImpact;
+    } else {
+      answer = `На основе анализа проекта: ${analysis.answers.priorities}`;
+    }
+    
+    res.json({
+      question,
+      answer,
+      analysis
+    });
+  } catch (err) {
+    res.status(500).json({ error: 'Ошибка: ' + err.message });
+  }
+});
 app.listen(PORT, () => {
   console.log(
     `🚀 Server started on port ${PORT}`
