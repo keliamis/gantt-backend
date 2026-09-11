@@ -464,6 +464,38 @@ app.put('/api/projects/:id', async (req, res) => {
   }
 });
 
+/**
+ * Удалить проект вместе со всеми его задачами.
+ * Задачи и их зависимости удаляются каскадно через FK в БД.
+ */
+app.delete('/api/projects/:id', async (req, res) => {
+  try {
+    const projectId = Number(req.params.id);
+
+    if (!Number.isInteger(projectId)) {
+      return res.status(400).json({ error: 'Некорректный ID проекта' });
+    }
+
+    const result = await pool.query(
+      'DELETE FROM projects WHERE id = $1 RETURNING id, name',
+      [projectId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Проект не найден' });
+    }
+
+    res.json({
+      success: true,
+      message: 'Проект удалён',
+      project: result.rows[0],
+    });
+  } catch (err) {
+    console.error('Ошибка удаления проекта:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ======================================================
 // TASKS
 // ======================================================
