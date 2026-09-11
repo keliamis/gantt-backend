@@ -1319,19 +1319,12 @@ app.get('/api/seed', async (req, res) => {
 });
 
 // ======================================================
-// 404
+// AI-АНАЛИЗ (УНИВЕРСАЛЬНЫЙ ОБРАБОТЧИК)
 // ======================================================
-
-
-
-// ... все остальные роуты ...
-
-// ======================================================
-// AI-анализ проекта
-// ======================================================
-app.get('/api/ai/analyze', async (req, res) => {
+const handleAI = async (req, res) => {
   try {
-    const projectId = req.query.projectId || req.query.id || 1;
+    // Ищем projectId везде: в URL или в теле запроса
+    const projectId = req.query.projectId || req.query.id || req.body.projectId || req.body.id || 1;
     
     const tasksRes = await pool.query('SELECT * FROM tasks WHERE project_id = $1', [projectId]);
     const tasks = tasksRes.rows;
@@ -1342,121 +1335,6 @@ app.get('/api/ai/analyze', async (req, res) => {
     if (!project) {
       return res.status(404).json({ error: 'Проект не найден' });
     }
-    
-    const today = new Date();
-    const todayStr = today.toISOString().split('T')[0];
-    
-    const totalTasks = tasks.length;
-    const completedTasks = tasks.filter(t => t.status === 'done').length;
-    const overdueTasks = tasks.filter(t => {
-      const endDate = new Date(t.end_date).toISOString().split('T')[0];
-      return endDate < todayStr && t.status !== 'done';
-    }).length;
-    const inProgressTasks = tasks.filter(t => t.status === 'in_progress').length;
-    
-    const criticalTasks = tasks.filter(t => {
-      const endDate = new Date(t.end_date);
-      const projectEnd = new Date(project.end_date);
-      return endDate >= projectEnd && t.status !== 'done';
-    });
-    
-    const risks = [];
-    
-    if (overdueTasks > 0) {
-      risks.push({
-        type: 'overdue',
-        severity: 'high',
-        message: `Просрочено задач: ${overdueTasks}`,
-        description: 'Некоторые задачи уже просрочены, что может повлиять на общий срок проекта'
-      });
-    }
-    
-    if (criticalTasks.length > 0) {
-      risks.push({
-        type: 'critical_path',
-        severity: 'medium',
-        message: `Критических задач: ${criticalTasks.length}`,
-        description: 'Эти задачи напрямую влияют на дедлайн проекта'
-      });
-    }
-    
-    const progressPercent = totalTasks > 0 ? Math.round((completedTasks / totalTasks) * 100) : 0;
-    
-    if (progressPercent < 50 && new Date(project.end_date) <= new Date()) {
-      risks.push({
-        type: 'deadline_risk',
-        severity: 'high',
-        message: 'Высокий риск срыва дедлайна',
-        description: `Выполнено только ${progressPercent}% задач до дедлайна`
-      });
-    }
-    
-    const recommendations = [];
-    
-    if (overdueTasks > 0) {
-      recommendations.push('Срочно займитесь просроченными задачами');
-    }
-    
-    if (inProgressTasks > 3) {
-      recommendations.push('Слишком много задач в работе одновременно. Сфокусируйтесь на завершении.');
-    }
-    
-    if (progressPercent < 30) {
-      recommendations.push('Проект на ранней стадии. Убедитесь, что все ресурсы распределены.');
-    }
-    
-    const analysis = {
-      summary: {
-        totalTasks,
-        completedTasks,
-        inProgressTasks,
-        overdueTasks,
-        progressPercent,
-        projectEndDate: project.end_date,
-        daysUntilDeadline: Math.ceil((new Date(project.end_date) - today) / (1000 * 60 * 60 * 24))
-      },
-      risks,
-      recommendations,
-      criticalTasks: criticalTasks.map(t => ({
-        id: t.id,
-        name: t.name,
-        endDate: t.end_date,
-        status: t.status
-      })),
-      answers: {
-        risks: risks.length > 0 
-          ? risks.map(r => r.message).join('. ') 
-          : 'Пока основных рисков не выявлено. Проект идет по плану.',
-        
-        priorities: recommendations.length > 0
-          ? recommendations.join('. ')
-          : 'Продолжайте работу в текущем режиме.',
-        
-        criticalImpact: criticalTasks.length > 0
-          ? `На срок проекта сильнее всего влияют: ${criticalTasks.map(t => t.name).join(', ')}`
-          : 'Все задачи выполняются в срок, критических задержек нет.'
-      }
-    };
-    
-    res.json(analysis);
-  } catch (err) {
-    console.error('Ошибка анализа проекта:', err);
-    res.status(500).json({ error: 'Ошибка при анализе проекта: ' + err.message });
-  }
-});
-
-// POST-эндпоинт для AI-вопросов
-app.post('/api/ai/ask', async (req, res) => {
-  try {
-    const { question, projectId } = req.body;
-    const id = projectId || req.query.projectId || 1;
-    
-    // Получаем анализ напрямую (без fetch к самому себе)
-    const tasksRes = await pool.query('SELECT * FROM tasks WHERE project_id = $1', [id]);
-    const tasks = tasksRes.rows;
-    
-    const projectRes = await pool.query('SELECT * FROM projects WHERE id = $1', [id]);
-    const project = projectRes.rows[0];
     
     const todayStr = new Date().toISOString().split('T')[0];
     const totalTasks = tasks.length;
@@ -1472,21 +1350,30 @@ app.post('/api/ai/ask', async (req, res) => {
     if (progressPercent < 50) risks.push('Низкий процент выполнения');
     
     const answer = risks.length > 0 
-      ? `Основные риски: ${risks.join('. ')}.` 
+      ? `Риски: ${risks.join('. ')}.` 
       : 'Проект идет по плану, критических рисков не выявлено.';
     
     res.json({
-      question,
-      answer,
-      summary: { totalTasks, completedTasks, overdueTasks, progressPercent }
+      success: true,
+      summary: { totalTasks, completedTasks, overdueTasks, progressPercent },
+      answer: answer
     });
   } catch (err) {
-    res.status(500).json({ error: 'Ошибка: ' + err.message });
+    console.error('AI Analyze Error:', err);
+    res.status(500).json({ error: 'Ошибка анализа: ' + err.message });
   }
-});
+};
 
 // ======================================================
-// 404 — ТЕПЕРЬ В САМОМ КОНЦЕ!
+// РЕГИСТРАЦИЯ МАРШРУТОВ (СТРОГО НА ВЕРХНЕМ УРОВНЕ!)
+// ======================================================
+app.get('/api/ai/analyze', handleAI);
+app.post('/api/ai/analyze', handleAI); // <-- ВОТ ЭТА СТРОКА ЛЕЧИТ 404 ОШИБКУ!
+app.post('/api/ai/ask', handleAI);
+app.get('/api/ai/ask', handleAI);
+
+// ======================================================
+// 404 (СТРОГО В САМОМ КОНЦЕ, ПОСЛЕ ВСЕХ МАРШРУТОВ!)
 // ======================================================
 app.use((req, res) => {
   res.status(404).json({
@@ -1495,9 +1382,8 @@ app.use((req, res) => {
 });
 
 // ======================================================
-// ЗАПУСК
+// ЗАПУСК СЕРВЕРА
 // ======================================================
 app.listen(PORT, () => {
   console.log(`🚀 Server started on port ${PORT}`);
 });
-
