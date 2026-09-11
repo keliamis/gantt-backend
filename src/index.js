@@ -67,29 +67,9 @@ async function getProjectData(projectId, client = pool) {
     [projectId]
   );
 
-  const tasks = tasksResult.rows.map((task) => {
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
-
-    const endDate = new Date(task.end_date);
-    endDate.setHours(0, 0, 0, 0);
-
-    if (
-      endDate < today &&
-      task.status !== 'done'
-    ) {
-      return {
-        ...task,
-        status: 'overdue',
-      };
-    }
-
-    return task;
-  });
-
   return {
     project: projectResult.rows[0],
-    tasks,
+    tasks: tasksResult.rows,
     dependencies: dependenciesResult.rows,
   };
 }
@@ -443,6 +423,47 @@ app.post('/api/projects', async (req, res) => {
   }
 });
 
+
+/**
+ * Обновить проект.
+ */
+app.put('/api/projects/:id', async (req, res) => {
+  try {
+    const projectId = Number(req.params.id);
+    const { name, start_date, end_date } = req.body;
+
+    if (!Number.isInteger(projectId)) {
+      return res.status(400).json({ error: 'Некорректный ID проекта' });
+    }
+
+    const current = await pool.query('SELECT * FROM projects WHERE id = $1', [projectId]);
+    if (current.rows.length === 0) {
+      return res.status(404).json({ error: 'Проект не найден' });
+    }
+
+    const old = current.rows[0];
+    const nextName = name !== undefined ? String(name).trim() : old.name;
+    const nextStart = start_date !== undefined ? start_date : old.start_date;
+    const nextEnd = end_date !== undefined ? end_date : old.end_date;
+
+    if (!nextName) return res.status(400).json({ error: 'Название проекта не может быть пустым' });
+    if (new Date(nextEnd) < new Date(nextStart)) {
+      return res.status(400).json({ error: 'Дата окончания проекта не может быть раньше даты начала' });
+    }
+
+    await pool.query(
+      `UPDATE projects SET name = $1, start_date = $2, end_date = $3 WHERE id = $4`,
+      [nextName, nextStart, nextEnd, projectId]
+    );
+
+    const data = await getProjectData(projectId);
+    res.json({ success: true, message: 'Проект обновлён', ...data });
+  } catch (err) {
+    console.error('Ошибка обновления проекта:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ======================================================
 // TASKS
 // ======================================================
@@ -648,9 +669,11 @@ app.put(
           : oldTask.assignee_id;
 
       const newProgress =
-        progress !== undefined
-          ? Number(progress)
-          : oldTask.progress;
+        newStatus === 'done'
+          ? 100
+          : progress !== undefined
+            ? Number(progress)
+            : oldTask.progress;
 
       if (!newName) {
         await client.query('ROLLBACK');
@@ -1049,6 +1072,75 @@ app.post(
     }
   }
 );
+
+
+/**
+ * Полностью заменить список предшественников задачи.
+ */
+app.put('/api/tasks/:id/dependencies', async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    await client.query('BEGIN');
+    const taskId = Number(req.params.id);
+    const predecessorIds = Array.isArray(req.body.predecessor_ids)
+      ? [...new Set(req.body.predecessor_ids.map(Number))]
+      : [];
+
+    if (!Number.isInteger(taskId)) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'Некорректный ID задачи' });
+    }
+
+    const taskResult = await client.query('SELECT id, project_id FROM tasks WHERE id = $1', [taskId]);
+    if (taskResult.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Задача не найдена' });
+    }
+
+    if (predecessorIds.some((id) => !Number.isInteger(id) || id === taskId)) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'Некорректная зависимость' });
+    }
+
+    if (predecessorIds.length) {
+      const candidates = await client.query(
+        'SELECT id, project_id FROM tasks WHERE id = ANY($1::int[])',
+        [predecessorIds]
+      );
+      if (candidates.rows.length !== predecessorIds.length || candidates.rows.some((row) => row.project_id !== taskResult.rows[0].project_id)) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ error: 'Все зависимости должны быть задачами этого же проекта' });
+      }
+    }
+
+    await client.query('DELETE FROM task_dependencies WHERE successor_id = $1', [taskId]);
+
+    for (const predecessorId of predecessorIds) {
+      const cycle = await createsCycle(predecessorId, taskId, client);
+      if (cycle) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ error: 'Невозможно сохранить зависимости: возникнет цикл' });
+      }
+      await client.query(
+        `INSERT INTO task_dependencies (predecessor_id, successor_id)
+         VALUES ($1, $2)
+         ON CONFLICT (predecessor_id, successor_id) DO NOTHING`,
+        [predecessorId, taskId]
+      );
+    }
+
+    await client.query('COMMIT');
+    const data = await getProjectData(taskResult.rows[0].project_id);
+    res.json({ success: true, message: 'Зависимости обновлены', ...data });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error('Ошибка обновления зависимостей:', err);
+    res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
+  }
+});
 
 // ======================================================
 // SEED
