@@ -1332,9 +1332,10 @@ app.use((req, res) => {
 // ЗАПУСК
 // ======================================================
 // AI-анализ проекта
-app.get('/api/projects/:id/analyze', async (req, res) => {
+app.get('/api/ai/analyze', async (req, res) => {
   try {
-    const projectId = req.params.id;
+    // Получаем projectId из query параметров (?projectId=1)
+    const projectId = req.query.projectId || req.query.id || 1;
     
     // Получаем все задачи проекта
     const tasksRes = await pool.query(
@@ -1464,10 +1465,10 @@ app.get('/api/projects/:id/analyze', async (req, res) => {
 });
 
 // POST-эндпоинт для AI-вопросов (если фронт отправляет вопросы)
-app.post('/api/projects/:id/ask', async (req, res) => {
+app.post('/api/ai/ask', async (req, res) => {
   try {
-    const { question } = req.body;
-    const projectId = req.params.id;
+    const { question, projectId } = req.body;
+    const id = projectId || req.query.projectId || 1;
     
     // Получаем анализ
     const analysisRes = await fetch(`http://localhost:${process.env.PORT || 3001}/api/projects/${projectId}/analyze`);
