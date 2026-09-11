@@ -1323,38 +1323,29 @@ app.get('/api/seed', async (req, res) => {
 // ======================================================
 
 
-// ======================================================
-// ЗАПУСК
+
+// ... все остальные роуты ...
+
 // ======================================================
 // AI-анализ проекта
+// ======================================================
 app.get('/api/ai/analyze', async (req, res) => {
   try {
-    // Получаем projectId из query параметров (?projectId=1)
     const projectId = req.query.projectId || req.query.id || 1;
     
-    // Получаем все задачи проекта
-    const tasksRes = await pool.query(
-      'SELECT * FROM tasks WHERE project_id = $1', 
-      [projectId]
-    );
+    const tasksRes = await pool.query('SELECT * FROM tasks WHERE project_id = $1', [projectId]);
     const tasks = tasksRes.rows;
     
-    // Получаем проект
-    const projectRes = await pool.query(
-      'SELECT * FROM projects WHERE id = $1', 
-      [projectId]
-    );
+    const projectRes = await pool.query('SELECT * FROM projects WHERE id = $1', [projectId]);
     const project = projectRes.rows[0];
     
     if (!project) {
       return res.status(404).json({ error: 'Проект не найден' });
     }
     
-    // Анализируем данные
     const today = new Date();
     const todayStr = today.toISOString().split('T')[0];
     
-    // Считаем статистику
     const totalTasks = tasks.length;
     const completedTasks = tasks.filter(t => t.status === 'done').length;
     const overdueTasks = tasks.filter(t => {
@@ -1363,14 +1354,12 @@ app.get('/api/ai/analyze', async (req, res) => {
     }).length;
     const inProgressTasks = tasks.filter(t => t.status === 'in_progress').length;
     
-    // Находим критические задачи (те, что влияют на срок проекта)
     const criticalTasks = tasks.filter(t => {
       const endDate = new Date(t.end_date);
       const projectEnd = new Date(project.end_date);
       return endDate >= projectEnd && t.status !== 'done';
     });
     
-    // Определяем основные риски
     const risks = [];
     
     if (overdueTasks > 0) {
@@ -1402,7 +1391,6 @@ app.get('/api/ai/analyze', async (req, res) => {
       });
     }
     
-    // Рекомендации
     const recommendations = [];
     
     if (overdueTasks > 0) {
@@ -1417,7 +1405,6 @@ app.get('/api/ai/analyze', async (req, res) => {
       recommendations.push('Проект на ранней стадии. Убедитесь, что все ресурсы распределены.');
     }
     
-    // Формируем ответ для AI
     const analysis = {
       summary: {
         totalTasks,
@@ -1436,7 +1423,6 @@ app.get('/api/ai/analyze', async (req, res) => {
         endDate: t.end_date,
         status: t.status
       })),
-      // Готовые ответы на вопросы
       answers: {
         risks: risks.length > 0 
           ? risks.map(r => r.message).join('. ') 
@@ -1459,46 +1445,59 @@ app.get('/api/ai/analyze', async (req, res) => {
   }
 });
 
-// POST-эндпоинт для AI-вопросов (если фронт отправляет вопросы)
+// POST-эндпоинт для AI-вопросов
 app.post('/api/ai/ask', async (req, res) => {
   try {
     const { question, projectId } = req.body;
     const id = projectId || req.query.projectId || 1;
     
-    // Получаем анализ
-    const analysisRes = await fetch(`http://localhost:${process.env.PORT || 3001}/api/projects/${projectId}/analyze`);
-    const analysis = await analysisRes.json();
+    // Получаем анализ напрямую (без fetch к самому себе)
+    const tasksRes = await pool.query('SELECT * FROM tasks WHERE project_id = $1', [id]);
+    const tasks = tasksRes.rows;
     
-    // Простые ответы на основе анализа
-    let answer = '';
+    const projectRes = await pool.query('SELECT * FROM projects WHERE id = $1', [id]);
+    const project = projectRes.rows[0];
     
-    if (question.includes('риск')) {
-      answer = analysis.answers.risks;
-    } else if (question.includes('приоритет') || question.includes('делать')) {
-      answer = analysis.answers.priorities;
-    } else if (question.includes('влияют') || question.includes('срок')) {
-      answer = analysis.answers.criticalImpact;
-    } else {
-      answer = `На основе анализа проекта: ${analysis.answers.priorities}`;
-    }
+    const todayStr = new Date().toISOString().split('T')[0];
+    const totalTasks = tasks.length;
+    const completedTasks = tasks.filter(t => t.status === 'done').length;
+    const overdueTasks = tasks.filter(t => {
+      const endDate = new Date(t.end_date).toISOString().split('T')[0];
+      return endDate < todayStr && t.status !== 'done';
+    }).length;
+    const progressPercent = totalTasks > 0 ? Math.round((completedTasks / totalTasks) * 100) : 0;
+    
+    const risks = [];
+    if (overdueTasks > 0) risks.push(`Просрочено задач: ${overdueTasks}`);
+    if (progressPercent < 50) risks.push('Низкий процент выполнения');
+    
+    const answer = risks.length > 0 
+      ? `Основные риски: ${risks.join('. ')}.` 
+      : 'Проект идет по плану, критических рисков не выявлено.';
     
     res.json({
       question,
       answer,
-      analysis
+      summary: { totalTasks, completedTasks, overdueTasks, progressPercent }
     });
   } catch (err) {
     res.status(500).json({ error: 'Ошибка: ' + err.message });
   }
 });
+
+// ======================================================
+// 404 — ТЕПЕРЬ В САМОМ КОНЦЕ!
+// ======================================================
 app.use((req, res) => {
   res.status(404).json({
     error: 'Endpoint не найден',
   });
 });
 
+// ======================================================
+// ЗАПУСК
+// ======================================================
 app.listen(PORT, () => {
-  console.log(
-    `🚀 Server started on port ${PORT}`
-  );
+  console.log(`🚀 Server started on port ${PORT}`);
 });
+
