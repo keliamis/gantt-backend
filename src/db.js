@@ -3,12 +3,17 @@ require('dotenv').config();
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  
-  ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
+
+  ssl:
+    process.env.NODE_ENV === 'production'
+      ? { rejectUnauthorized: false }
+      : false,
 });
-// Функция инициализации таблиц 
+
+// Функция инициализации таблиц
 async function initDB() {
   const client = await pool.connect();
+
   try {
     await client.query(`
       CREATE TABLE IF NOT EXISTS users (
@@ -42,6 +47,7 @@ async function initDB() {
         UNIQUE(predecessor_id, successor_id)
       );
     `);
+
     console.log('✅ База данных и таблицы успешно инициализированы!');
   } catch (err) {
     console.error('❌ Ошибка инициализации БД:', err);
