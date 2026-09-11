@@ -29,6 +29,90 @@ function formatDate(date) {
 }
 
 /**
+ * Рассчитывает ID задач, лежащих на критическом пути (метод CPM).
+ * Критический путь — самая длинная цепочка задач с нулевым резервом времени.
+ */
+function calculateCriticalPathIds(tasks, dependencies) {
+  if (tasks.length === 0) return [];
+
+  // 1. Строим карту задач с длительностью
+  const taskMap = {};
+  tasks.forEach((t) => {
+    const start = new Date(t.start_date);
+    const end = new Date(t.end_date);
+    start.setHours(0, 0, 0, 0);
+    end.setHours(0, 0, 0, 0);
+    const duration = Math.max(1, Math.ceil((end - start) / (1000 * 60 * 60 * 24)));
+
+    taskMap[t.id] = {
+      id: t.id,
+      duration,
+      predecessors: [],
+      successors: [],
+      earlyStart: 0,
+      earlyFinish: 0,
+      lateStart: 0,
+      lateFinish: 0,
+    };
+  });
+
+  // 2. Строим граф зависимостей
+  dependencies.forEach((d) => {
+    const predId = d.predecessor_id;
+    const succId = d.successor_id;
+    if (taskMap[predId] && taskMap[succId]) {
+      taskMap[predId].successors.push(succId);
+      taskMap[succId].predecessors.push(predId);
+    }
+  });
+
+  // 3. Forward Pass: считаем раннее начало и окончание
+  const calculateEarly = (taskId, visited = new Set()) => {
+    if (visited.has(taskId)) return;
+    visited.add(taskId);
+
+    const task = taskMap[taskId];
+    let maxPredFinish = 0;
+
+    task.predecessors.forEach((predId) => {
+      calculateEarly(predId, visited);
+      maxPredFinish = Math.max(maxPredFinish, taskMap[predId].earlyFinish);
+    });
+
+    task.earlyStart = maxPredFinish;
+    task.earlyFinish = task.earlyStart + task.duration;
+  };
+
+  Object.keys(taskMap).forEach((id) => calculateEarly(id));
+
+  const projectDuration = Math.max(...Object.values(taskMap).map((t) => t.earlyFinish));
+
+  // 4. Backward Pass: считаем позднее начало и окончание
+  const calculateLate = (taskId, visited = new Set()) => {
+    if (visited.has(taskId)) return;
+    visited.add(taskId);
+
+    const task = taskMap[taskId];
+    let minSuccStart = projectDuration;
+
+    task.successors.forEach((succId) => {
+      calculateLate(succId, visited);
+      minSuccStart = Math.min(minSuccStart, taskMap[succId].lateStart);
+    });
+
+    task.lateFinish = minSuccStart;
+    task.lateStart = task.lateFinish - task.duration;
+  };
+
+  Object.keys(taskMap).forEach((id) => calculateLate(id));
+
+  // 5. Критический путь = задачи, где раннее начало == позднее начало (резерв = 0)
+  return Object.values(taskMap)
+    .filter((t) => Math.abs(t.earlyStart - t.lateStart) < 1)
+    .map((t) => t.id);
+}
+
+/**
  * Возвращает проект вместе с задачами и зависимостями.
  */
 async function getProjectData(projectId, client = pool) {
@@ -67,10 +151,46 @@ async function getProjectData(projectId, client = pool) {
     [projectId]
   );
 
+  // ============================================
+  // 1. ОПРЕДЕЛЕНИЕ ПРОСРОЧЕННЫХ ЗАДАЧ (overdue)
+  // ============================================
+  const today = new Date();
+  today.setHours(0, 0, 0, 0); // Обнуляем время, сравниваем только даты
+
+  const tasksWithStatus = tasksResult.rows.map((task) => {
+    const endDate = new Date(task.end_date);
+    endDate.setHours(0, 0, 0, 0);
+
+    // Если дата окончания прошла И задача не завершена — она просрочена
+    if (endDate < today && task.status !== 'done') {
+      return {
+        ...task,
+        status: 'overdue',
+      };
+    }
+
+    return task;
+  });
+
+  // ============================================
+  // 2. РАСЧЁТ КРИТИЧЕСКОГО ПУТИ (CPM)
+  // ============================================
+  const criticalPathTaskIds = calculateCriticalPathIds(
+    tasksWithStatus,
+    dependenciesResult.rows
+  );
+
+  // Добавляем флаг isCriticalPath к каждой задаче
+  const tasksWithCriticalPath = tasksWithStatus.map((task) => ({
+    ...task,
+    isCriticalPath: criticalPathTaskIds.includes(task.id),
+  }));
+
   return {
     project: projectResult.rows[0],
-    tasks: tasksResult.rows,
+    tasks: tasksWithCriticalPath,
     dependencies: dependenciesResult.rows,
+    criticalPathTaskIds,
   };
 }
 
