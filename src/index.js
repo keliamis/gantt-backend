@@ -1322,11 +1322,6 @@ app.get('/api/seed', async (req, res) => {
 // 404
 // ======================================================
 
-app.use((req, res) => {
-  res.status(404).json({
-    error: 'Endpoint не найден',
-  });
-});
 
 // ======================================================
 // ЗАПУСК
@@ -1496,6 +1491,12 @@ app.post('/api/ai/ask', async (req, res) => {
     res.status(500).json({ error: 'Ошибка: ' + err.message });
   }
 });
+app.use((req, res) => {
+  res.status(404).json({
+    error: 'Endpoint не найден',
+  });
+});
+
 app.listen(PORT, () => {
   console.log(
     `🚀 Server started on port ${PORT}`
