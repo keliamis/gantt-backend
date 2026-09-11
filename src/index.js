@@ -32,84 +32,92 @@ function formatDate(date) {
  * Рассчитывает ID задач, лежащих на критическом пути (метод CPM).
  * Критический путь — самая длинная цепочка задач с нулевым резервом времени.
  */
-function calculateCriticalPathIds(tasks, dependencies) {
-  if (tasks.length === 0) return [];
+function calculateCriticalPathData(tasks, dependencies) {
+  if (!tasks.length) {
+    return { ids: [], totalDays: 0, names: [] };
+  }
 
-  // 1. Строим карту задач с длительностью
-  const taskMap = {};
-  tasks.forEach((t) => {
-    const start = new Date(t.start_date);
-    const end = new Date(t.end_date);
-    start.setHours(0, 0, 0, 0);
-    end.setHours(0, 0, 0, 0);
-    const duration = Math.max(1, Math.ceil((end - start) / (1000 * 60 * 60 * 24)));
+  const byId = new Map(tasks.map((task) => [Number(task.id), task]));
+  const incoming = new Map();
+  const outgoing = new Map();
 
-    taskMap[t.id] = {
-      id: t.id,
-      duration,
-      predecessors: [],
-      successors: [],
-      earlyStart: 0,
-      earlyFinish: 0,
-      lateStart: 0,
-      lateFinish: 0,
-    };
-  });
+  for (const task of tasks) {
+    incoming.set(Number(task.id), []);
+    outgoing.set(Number(task.id), []);
+  }
 
-  // 2. Строим граф зависимостей
-  dependencies.forEach((d) => {
-    const predId = d.predecessor_id;
-    const succId = d.successor_id;
-    if (taskMap[predId] && taskMap[succId]) {
-      taskMap[predId].successors.push(succId);
-      taskMap[succId].predecessors.push(predId);
+  for (const dep of dependencies) {
+    const from = Number(dep.predecessor_id);
+    const to = Number(dep.successor_id);
+    if (!byId.has(from) || !byId.has(to)) continue;
+    outgoing.get(from).push(to);
+    incoming.get(to).push(from);
+  }
+
+  const indegree = new Map([...incoming.entries()].map(([id, preds]) => [id, preds.length]));
+  const queue = [...indegree.entries()].filter(([, degree]) => degree === 0).map(([id]) => id);
+  const order = [];
+
+  while (queue.length) {
+    const id = queue.shift();
+    order.push(id);
+    for (const next of outgoing.get(id) || []) {
+      indegree.set(next, indegree.get(next) - 1);
+      if (indegree.get(next) === 0) queue.push(next);
     }
-  });
+  }
 
-  // 3. Forward Pass: считаем раннее начало и окончание
-  const calculateEarly = (taskId, visited = new Set()) => {
-    if (visited.has(taskId)) return;
-    visited.add(taskId);
+  if (order.length !== tasks.length) {
+    return { ids: [], totalDays: 0, names: [], hasCycle: true };
+  }
 
-    const task = taskMap[taskId];
-    let maxPredFinish = 0;
+  const best = new Map();
 
-    task.predecessors.forEach((predId) => {
-      calculateEarly(predId, visited);
-      maxPredFinish = Math.max(maxPredFinish, taskMap[predId].earlyFinish);
-    });
+  for (const id of order) {
+    const task = byId.get(id);
+    const taskStart = new Date(task.start_date);
+    const taskEnd = new Date(task.end_date);
+    taskStart.setHours(0, 0, 0, 0);
+    taskEnd.setHours(0, 0, 0, 0);
 
-    task.earlyStart = maxPredFinish;
-    task.earlyFinish = task.earlyStart + task.duration;
-  };
+    let winner = {
+      ids: [id],
+      start: taskStart,
+      end: taskEnd,
+      span: Math.max(1, Math.round((taskEnd - taskStart) / 86400000)),
+    };
 
-  Object.keys(taskMap).forEach((id) => calculateEarly(id));
+    for (const predId of incoming.get(id) || []) {
+      const pred = best.get(predId);
+      if (!pred) continue;
+      const pathStart = pred.start < taskStart ? pred.start : taskStart;
+      const pathEnd = pred.end > taskEnd ? pred.end : taskEnd;
+      const span = Math.max(1, Math.round((pathEnd - pathStart) / 86400000));
+      if (span > winner.span || (span === winner.span && pred.ids.length + 1 > winner.ids.length)) {
+        winner = {
+          ids: [...pred.ids, id],
+          start: pathStart,
+          end: pathEnd,
+          span,
+        };
+      }
+    }
 
-  const projectDuration = Math.max(...Object.values(taskMap).map((t) => t.earlyFinish));
+    best.set(id, winner);
+  }
 
-  // 4. Backward Pass: считаем позднее начало и окончание
-  const calculateLate = (taskId, visited = new Set()) => {
-    if (visited.has(taskId)) return;
-    visited.add(taskId);
+  let result = { ids: [], totalDays: 0, names: [] };
+  for (const value of best.values()) {
+    if (value.span > result.totalDays || (value.span === result.totalDays && value.ids.length > result.ids.length)) {
+      result = {
+        ids: value.ids,
+        totalDays: value.span,
+        names: value.ids.map((id) => byId.get(id)?.name).filter(Boolean),
+      };
+    }
+  }
 
-    const task = taskMap[taskId];
-    let minSuccStart = projectDuration;
-
-    task.successors.forEach((succId) => {
-      calculateLate(succId, visited);
-      minSuccStart = Math.min(minSuccStart, taskMap[succId].lateStart);
-    });
-
-    task.lateFinish = minSuccStart;
-    task.lateStart = task.lateFinish - task.duration;
-  };
-
-  Object.keys(taskMap).forEach((id) => calculateLate(id));
-
-  // 5. Критический путь = задачи, где раннее начало == позднее начало (резерв = 0)
-  return Object.values(taskMap)
-    .filter((t) => Math.abs(t.earlyStart - t.lateStart) < 1)
-    .map((t) => t.id);
+  return result;
 }
 
 /**
@@ -151,46 +159,43 @@ async function getProjectData(projectId, client = pool) {
     [projectId]
   );
 
-  // ============================================
-  // 1. ОПРЕДЕЛЕНИЕ ПРОСРОЧЕННЫХ ЗАДАЧ (overdue)
-  // ============================================
   const today = new Date();
-  today.setHours(0, 0, 0, 0); // Обнуляем время, сравниваем только даты
+  today.setHours(0, 0, 0, 0);
 
-  const tasksWithStatus = tasksResult.rows.map((task) => {
+  // Просрочка — вычисляемый признак, а не статус задачи.
+  // Это позволяет сохранять реальный workflow-статус: planned / in_progress / done.
+  const tasksWithMeta = tasksResult.rows.map((task) => {
     const endDate = new Date(task.end_date);
     endDate.setHours(0, 0, 0, 0);
+    const isOverdue = task.status !== 'done' && endDate < today;
+    const overdueDays = isOverdue
+      ? Math.max(1, Math.floor((today - endDate) / 86400000))
+      : 0;
 
-    // Если дата окончания прошла И задача не завершена — она просрочена
-    if (endDate < today && task.status !== 'done') {
-      return {
-        ...task,
-        status: 'overdue',
-      };
-    }
-
-    return task;
+    return {
+      ...task,
+      is_overdue: isOverdue,
+      overdue_days: overdueDays,
+    };
   });
 
-  // ============================================
-  // 2. РАСЧЁТ КРИТИЧЕСКОГО ПУТИ (CPM)
-  // ============================================
-  const criticalPathTaskIds = calculateCriticalPathIds(
-    tasksWithStatus,
+  const criticalPath = calculateCriticalPathData(
+    tasksWithMeta,
     dependenciesResult.rows
   );
 
-  // Добавляем флаг isCriticalPath к каждой задаче
-  const tasksWithCriticalPath = tasksWithStatus.map((task) => ({
+  const criticalIds = new Set(criticalPath.ids.map(Number));
+  const tasksWithCriticalPath = tasksWithMeta.map((task) => ({
     ...task,
-    isCriticalPath: criticalPathTaskIds.includes(task.id),
+    isCriticalPath: criticalIds.has(Number(task.id)),
   }));
 
   return {
     project: projectResult.rows[0],
     tasks: tasksWithCriticalPath,
     dependencies: dependenciesResult.rows,
-    criticalPathTaskIds,
+    criticalPathTaskIds: criticalPath.ids,
+    criticalPath,
   };
 }
 
@@ -443,9 +448,59 @@ app.post('/api/users', async (req, res) => {
   }
 });
 
+
+/**
+ * Удалить участника. В уже существующих задачах ответственный станет пустым.
+ */
+app.delete('/api/users/:id', async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const userId = Number(req.params.id);
+    if (!Number.isInteger(userId)) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'Некорректный ID пользователя' });
+    }
+
+    await client.query('UPDATE tasks SET assignee_id = NULL WHERE assignee_id = $1', [userId]);
+    const result = await client.query('DELETE FROM users WHERE id = $1 RETURNING id, name', [userId]);
+    if (!result.rows.length) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Пользователь не найден' });
+    }
+
+    await client.query('COMMIT');
+    res.json({ success: true, user: result.rows[0] });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error('Ошибка удаления пользователя:', err);
+    res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
 // ======================================================
 // PROJECTS
 // ======================================================
+
+/**
+ * Список проектов для понятного переключения в интерфейсе.
+ */
+app.get('/api/projects', async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT id, name, start_date, end_date, status, created_at, updated_at
+      FROM projects
+      ORDER BY updated_at DESC NULLS LAST, id DESC
+    `);
+    res.json(result.rows);
+  } catch (err) {
+    console.error('Ошибка загрузки списка проектов:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 
 /**
  * Получить проект вместе с задачами
@@ -494,6 +549,7 @@ app.post('/api/projects', async (req, res) => {
       name,
       start_date,
       end_date,
+      status = 'planned',
     } = req.body;
 
     if (!name || !start_date || !end_date) {
@@ -518,15 +574,18 @@ app.post('/api/projects', async (req, res) => {
         INSERT INTO projects (
           name,
           start_date,
-          end_date
+          end_date,
+          status,
+          updated_at
         )
-        VALUES ($1, $2, $3)
+        VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP)
         RETURNING *
       `,
       [
         name.trim(),
         start_date,
         end_date,
+        status,
       ]
     );
 
@@ -550,7 +609,7 @@ app.post('/api/projects', async (req, res) => {
 app.put('/api/projects/:id', async (req, res) => {
   try {
     const projectId = Number(req.params.id);
-    const { name, start_date, end_date } = req.body;
+    const { name, start_date, end_date, status } = req.body;
 
     if (!Number.isInteger(projectId)) {
       return res.status(400).json({ error: 'Некорректный ID проекта' });
@@ -565,15 +624,23 @@ app.put('/api/projects/:id', async (req, res) => {
     const nextName = name !== undefined ? String(name).trim() : old.name;
     const nextStart = start_date !== undefined ? start_date : old.start_date;
     const nextEnd = end_date !== undefined ? end_date : old.end_date;
+    const nextStatus = status !== undefined ? status : (old.status || 'planned');
 
     if (!nextName) return res.status(400).json({ error: 'Название проекта не может быть пустым' });
     if (new Date(nextEnd) < new Date(nextStart)) {
       return res.status(400).json({ error: 'Дата окончания проекта не может быть раньше даты начала' });
     }
 
+    const allowedProjectStatuses = ['planned', 'in_progress', 'done', 'paused'];
+    if (!allowedProjectStatuses.includes(nextStatus)) {
+      return res.status(400).json({ error: 'Некорректный статус проекта' });
+    }
+
     await pool.query(
-      `UPDATE projects SET name = $1, start_date = $2, end_date = $3 WHERE id = $4`,
-      [nextName, nextStart, nextEnd, projectId]
+      `UPDATE projects
+       SET name = $1, start_date = $2, end_date = $3, status = $4, updated_at = CURRENT_TIMESTAMP
+       WHERE id = $5`,
+      [nextName, nextStart, nextEnd, nextStatus, projectId]
     );
 
     const data = await getProjectData(projectId);
@@ -631,6 +698,9 @@ app.post('/api/tasks', async (req, res) => {
       start_date,
       end_date,
       assignee_id,
+      comments = '',
+      status = 'planned',
+      progress = 0,
     } = req.body;
 
     if (
@@ -686,6 +756,15 @@ app.post('/api/tasks', async (req, res) => {
       }
     }
 
+    const allowedTaskStatuses = ['planned', 'todo', 'in_progress', 'done'];
+    if (!allowedTaskStatuses.includes(status)) {
+      return res.status(400).json({ error: 'Некорректный статус задачи' });
+    }
+    const normalizedProgress = status === 'done' ? 100 : Number(progress);
+    if (!Number.isFinite(normalizedProgress) || normalizedProgress < 0 || normalizedProgress > 100) {
+      return res.status(400).json({ error: 'Прогресс должен быть от 0 до 100' });
+    }
+
     const result = await pool.query(
       `
         INSERT INTO tasks (
@@ -693,9 +772,13 @@ app.post('/api/tasks', async (req, res) => {
           assignee_id,
           name,
           start_date,
-          end_date
+          end_date,
+          status,
+          progress,
+          comments,
+          updated_at
         )
-        VALUES ($1, $2, $3, $4, $5)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, CURRENT_TIMESTAMP)
         RETURNING *
       `,
       [
@@ -704,6 +787,9 @@ app.post('/api/tasks', async (req, res) => {
         name.trim(),
         start_date,
         end_date,
+        status,
+        normalizedProgress,
+        String(comments || '').trim(),
       ]
     );
 
@@ -781,6 +867,7 @@ app.put(
         status,
         assignee_id,
         progress,
+        comments,
       } = req.body;
 
       const newName =
@@ -826,6 +913,10 @@ app.put(
           : progress !== undefined
             ? Number(progress)
             : oldTask.progress;
+
+      const newComments = comments !== undefined
+        ? String(comments || '').trim()
+        : (oldTask.comments || '');
 
       if (!newName) {
         await client.query('ROLLBACK');
@@ -932,8 +1023,10 @@ app.put(
             end_date = $3,
             status = $4,
             assignee_id = $5,
-            progress = $6
-          WHERE id = $7
+            progress = $6,
+            comments = $7,
+            updated_at = CURRENT_TIMESTAMP
+          WHERE id = $8
         `,
         [
           newName,
@@ -942,6 +1035,7 @@ app.put(
           newStatus,
           newAssigneeId ?? null,
           newProgress,
+          newComments,
           taskId,
         ]
       );
@@ -1568,7 +1662,7 @@ app.get('/api/seed', async (req, res) => {
 
 app.post('/api/ai/analyze', async (req, res) => {
   try {
-    const { question, context } = req.body;
+    const { question, context, project_id } = req.body;
 
     if (!question || typeof question !== 'string' || !question.trim()) {
       return res.status(400).json({
@@ -1576,10 +1670,37 @@ app.post('/api/ai/analyze', async (req, res) => {
       });
     }
 
-    if (!context) {
-      return res.status(400).json({
-        error: 'Не переданы данные проекта',
-      });
+    let finalContext = context || null;
+
+    if (project_id) {
+      const fresh = await getProjectData(Number(project_id));
+      if (!fresh) {
+        return res.status(404).json({ error: 'Проект не найден' });
+      }
+
+      const overdue = fresh.tasks.filter((task) => task.is_overdue);
+      const unassigned = fresh.tasks.filter((task) => task.assignee_id == null && task.status !== 'done');
+      const projectEnd = fresh.project.end_date ? new Date(fresh.project.end_date) : null;
+      const beyondProject = projectEnd
+        ? fresh.tasks.filter((task) => new Date(task.end_date) > projectEnd)
+        : [];
+
+      finalContext = {
+        project: fresh.project,
+        tasks: fresh.tasks,
+        dependencies: fresh.dependencies,
+        critical_path: fresh.criticalPath,
+        computed_facts: {
+          overdue_count: overdue.length,
+          overdue_tasks: overdue.map((task) => ({ name: task.name, overdue_days: task.overdue_days })),
+          unassigned_active_count: unassigned.length,
+          tasks_beyond_project_deadline: beyondProject.map((task) => task.name),
+        },
+      };
+    }
+
+    if (!finalContext) {
+      return res.status(400).json({ error: 'Не переданы данные проекта' });
     }
 
     const { AI_API_KEY, AI_BASE_URL, AI_MODEL } = process.env;
@@ -1610,7 +1731,11 @@ app.post('/api/ai/analyze', async (req, res) => {
               content: `
 Ты AI-ассистент руководителя проекта.
 Анализируй только переданные данные проекта.
-Отвечай на русском языке, кратко и конкретно.
+Отвечай на русском языке, конкретно и проверяемо.
+Сначала дай вывод в 1-2 предложениях, затем перечисли факты и действия.
+Если риска нет — прямо скажи, что риска по имеющимся данным нет.
+Не называй задачу просроченной, если computed_facts не подтверждает просрочку.
+Не пересчитывай критический путь самостоятельно: используй critical_path из контекста.
 
 Обращай внимание на:
 - просроченные задачи;
@@ -1633,7 +1758,7 @@ app.post('/api/ai/analyze', async (req, res) => {
 ${question.trim()}
 
 Данные проекта:
-${JSON.stringify(context, null, 2)}
+${JSON.stringify(finalContext, null, 2)}
               `.trim(),
             },
           ],

@@ -26,18 +26,22 @@ async function initDB() {
         name VARCHAR(255) NOT NULL,
         start_date DATE,
         end_date DATE,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        status VARCHAR(50) DEFAULT 'planned',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );
 
       CREATE TABLE IF NOT EXISTS tasks (
         id SERIAL PRIMARY KEY,
         project_id INT REFERENCES projects(id) ON DELETE CASCADE,
-        assignee_id INT REFERENCES users(id),
+        assignee_id INT REFERENCES users(id) ON DELETE SET NULL,
         name VARCHAR(255) NOT NULL,
         start_date DATE NOT NULL,
         end_date DATE NOT NULL,
         status VARCHAR(50) DEFAULT 'planned',
-        progress INT DEFAULT 0
+        progress INT DEFAULT 0,
+        comments TEXT DEFAULT '',
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );
 
       CREATE TABLE IF NOT EXISTS task_dependencies (
@@ -46,6 +50,17 @@ async function initDB() {
         successor_id INT REFERENCES tasks(id) ON DELETE CASCADE,
         UNIQUE(predecessor_id, successor_id)
       );
+
+      ALTER TABLE projects
+        ADD COLUMN IF NOT EXISTS status VARCHAR(50) DEFAULT 'planned',
+        ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
+
+      ALTER TABLE tasks
+        ADD COLUMN IF NOT EXISTS comments TEXT DEFAULT '',
+        ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
+
+      UPDATE tasks SET status = 'planned' WHERE status = 'overdue';
+
     `);
 
     console.log('✅ База данных и таблицы успешно инициализированы!');
