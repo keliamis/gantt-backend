@@ -51,15 +51,38 @@ async function initDB() {
         UNIQUE(predecessor_id, successor_id)
       );
 
+      CREATE TABLE IF NOT EXISTS project_members (
+        project_id INT REFERENCES projects(id) ON DELETE CASCADE,
+        user_id INT REFERENCES users(id) ON DELETE CASCADE,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (project_id, user_id)
+      );
+
+      CREATE TABLE IF NOT EXISTS milestones (
+        id SERIAL PRIMARY KEY,
+        project_id INT REFERENCES projects(id) ON DELETE CASCADE,
+        name VARCHAR(255) NOT NULL,
+        date DATE NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+
       ALTER TABLE projects
         ADD COLUMN IF NOT EXISTS status VARCHAR(50) DEFAULT 'planned',
         ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
 
       ALTER TABLE tasks
         ADD COLUMN IF NOT EXISTS comments TEXT DEFAULT '',
+        ADD COLUMN IF NOT EXISTS progress_before_done INT DEFAULT 0,
         ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
 
       UPDATE tasks SET status = 'planned' WHERE status = 'overdue';
+
+      INSERT INTO project_members (project_id, user_id)
+      SELECT DISTINCT project_id, assignee_id
+      FROM tasks
+      WHERE project_id IS NOT NULL AND assignee_id IS NOT NULL
+      ON CONFLICT DO NOTHING;
 
     `);
 
