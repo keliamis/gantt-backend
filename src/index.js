@@ -32,9 +32,17 @@ function formatDate(date) {
  * Рассчитывает ID задач, лежащих на критическом пути (метод CPM).
  * Критический путь — самая длинная цепочка задач с нулевым резервом времени.
  */
+function taskDurationDays(task) {
+  const start = new Date(task.start_date);
+  const end = new Date(task.end_date);
+  start.setHours(0, 0, 0, 0);
+  end.setHours(0, 0, 0, 0);
+  return Math.max(1, Math.round((end - start) / 86400000));
+}
+
 function calculateCriticalPathData(tasks, dependencies) {
   if (!tasks.length) {
-    return { ids: [], totalDays: 0, names: [] };
+    return { ids: [], totalDays: 0, names: [], hasCycle: false };
   }
 
   const byId = new Map(tasks.map((task) => [Number(task.id), task]));
@@ -42,8 +50,9 @@ function calculateCriticalPathData(tasks, dependencies) {
   const outgoing = new Map();
 
   for (const task of tasks) {
-    incoming.set(Number(task.id), []);
-    outgoing.set(Number(task.id), []);
+    const id = Number(task.id);
+    incoming.set(id, []);
+    outgoing.set(id, []);
   }
 
   for (const dep of dependencies) {
@@ -71,53 +80,48 @@ function calculateCriticalPathData(tasks, dependencies) {
     return { ids: [], totalDays: 0, names: [], hasCycle: true };
   }
 
-  const best = new Map();
+  const longest = new Map();
+  const previous = new Map();
 
   for (const id of order) {
-    const task = byId.get(id);
-    const taskStart = new Date(task.start_date);
-    const taskEnd = new Date(task.end_date);
-    taskStart.setHours(0, 0, 0, 0);
-    taskEnd.setHours(0, 0, 0, 0);
+    const ownDuration = taskDurationDays(byId.get(id));
+    const preds = incoming.get(id) || [];
 
-    let winner = {
-      ids: [id],
-      start: taskStart,
-      end: taskEnd,
-      span: Math.max(1, Math.round((taskEnd - taskStart) / 86400000)),
-    };
+    if (!preds.length) {
+      longest.set(id, ownDuration);
+      previous.set(id, null);
+      continue;
+    }
 
-    for (const predId of incoming.get(id) || []) {
-      const pred = best.get(predId);
-      if (!pred) continue;
-      const pathStart = pred.start < taskStart ? pred.start : taskStart;
-      const pathEnd = pred.end > taskEnd ? pred.end : taskEnd;
-      const span = Math.max(1, Math.round((pathEnd - pathStart) / 86400000));
-      if (span > winner.span || (span === winner.span && pred.ids.length + 1 > winner.ids.length)) {
-        winner = {
-          ids: [...pred.ids, id],
-          start: pathStart,
-          end: pathEnd,
-          span,
-        };
+    let bestPred = preds[0];
+    for (const pred of preds) {
+      if ((longest.get(pred) || 0) > (longest.get(bestPred) || 0)) {
+        bestPred = pred;
       }
     }
 
-    best.set(id, winner);
+    longest.set(id, (longest.get(bestPred) || 0) + ownDuration);
+    previous.set(id, bestPred);
   }
 
-  let result = { ids: [], totalDays: 0, names: [] };
-  for (const value of best.values()) {
-    if (value.span > result.totalDays || (value.span === result.totalDays && value.ids.length > result.ids.length)) {
-      result = {
-        ids: value.ids,
-        totalDays: value.span,
-        names: value.ids.map((id) => byId.get(id)?.name).filter(Boolean),
-      };
-    }
+  let endId = order[0];
+  for (const id of order) {
+    if ((longest.get(id) || 0) > (longest.get(endId) || 0)) endId = id;
   }
 
-  return result;
+  const ids = [];
+  let cursor = endId;
+  while (cursor) {
+    ids.unshift(cursor);
+    cursor = previous.get(cursor);
+  }
+
+  return {
+    ids,
+    totalDays: longest.get(endId) || 0,
+    names: ids.map((id) => byId.get(id)?.name).filter(Boolean),
+    hasCycle: false,
+  };
 }
 
 /**
@@ -190,10 +194,29 @@ async function getProjectData(projectId, client = pool) {
     isCriticalPath: criticalIds.has(Number(task.id)),
   }));
 
+  const membersResult = await client.query(
+    `SELECT u.id, u.name
+     FROM project_members pm
+     JOIN users u ON u.id = pm.user_id
+     WHERE pm.project_id = $1
+     ORDER BY u.name, u.id`,
+    [projectId]
+  );
+
+  const milestonesResult = await client.query(
+    `SELECT id, project_id, name, date
+     FROM milestones
+     WHERE project_id = $1
+     ORDER BY date, id`,
+    [projectId]
+  );
+
   return {
     project: projectResult.rows[0],
     tasks: tasksWithCriticalPath,
     dependencies: dependenciesResult.rows,
+    users: membersResult.rows,
+    milestones: milestonesResult.rows,
     criticalPathTaskIds: criticalPath.ids,
     criticalPath,
   };
@@ -364,6 +387,87 @@ async function createsCycle(
   }
 
   return false;
+}
+
+
+async function isProjectMember(projectId, userId, client = pool) {
+  if (userId === null || userId === undefined) return true;
+  const result = await client.query(
+    'SELECT 1 FROM project_members WHERE project_id = $1 AND user_id = $2',
+    [projectId, userId]
+  );
+  return result.rows.length > 0;
+}
+
+async function enforceDependencySchedule(projectId, client) {
+  const tasksResult = await client.query(
+    'SELECT * FROM tasks WHERE project_id = $1 ORDER BY id',
+    [projectId]
+  );
+  const depsResult = await client.query(
+    `SELECT td.predecessor_id, td.successor_id
+     FROM task_dependencies td
+     JOIN tasks t ON t.id = td.successor_id
+     WHERE t.project_id = $1`,
+    [projectId]
+  );
+
+  const tasks = new Map(tasksResult.rows.map((task) => [Number(task.id), task]));
+  const incoming = new Map([...tasks.keys()].map((id) => [id, []]));
+  const outgoing = new Map([...tasks.keys()].map((id) => [id, []]));
+  const indegree = new Map([...tasks.keys()].map((id) => [id, 0]));
+
+  for (const dep of depsResult.rows) {
+    const from = Number(dep.predecessor_id);
+    const to = Number(dep.successor_id);
+    if (!tasks.has(from) || !tasks.has(to)) continue;
+    incoming.get(to).push(from);
+    outgoing.get(from).push(to);
+    indegree.set(to, indegree.get(to) + 1);
+  }
+
+  const queue = [...indegree.entries()].filter(([, degree]) => degree === 0).map(([id]) => id);
+  const order = [];
+  while (queue.length) {
+    const id = queue.shift();
+    order.push(id);
+    for (const next of outgoing.get(id) || []) {
+      indegree.set(next, indegree.get(next) - 1);
+      if (indegree.get(next) === 0) queue.push(next);
+    }
+  }
+
+  if (order.length !== tasks.size) {
+    throw new Error('Невозможно пересчитать расписание: обнаружен цикл зависимостей');
+  }
+
+  for (const id of order) {
+    const preds = incoming.get(id) || [];
+    if (!preds.length) continue;
+
+    let requiredStart = null;
+    for (const predId of preds) {
+      const pred = tasks.get(predId);
+      const end = new Date(pred.end_date);
+      end.setHours(0, 0, 0, 0);
+      if (!requiredStart || end > requiredStart) requiredStart = end;
+    }
+
+    const task = tasks.get(id);
+    const currentStart = new Date(task.start_date);
+    currentStart.setHours(0, 0, 0, 0);
+    if (requiredStart && currentStart < requiredStart) {
+      const deltaDays = Math.round((requiredStart - currentStart) / 86400000);
+      const newStart = addDays(new Date(task.start_date), deltaDays);
+      const newEnd = addDays(new Date(task.end_date), deltaDays);
+      await client.query(
+        `UPDATE tasks SET start_date = $1, end_date = $2, updated_at = CURRENT_TIMESTAMP WHERE id = $3`,
+        [formatDate(newStart), formatDate(newEnd), id]
+      );
+      task.start_date = formatDate(newStart);
+      task.end_date = formatDate(newEnd);
+    }
+  }
 }
 
 // ======================================================
@@ -544,61 +648,58 @@ app.get(
  * Создать проект.
  */
 app.post('/api/projects', async (req, res) => {
+  const client = await pool.connect();
   try {
+    await client.query('BEGIN');
     const {
       name,
       start_date,
       end_date,
       status = 'planned',
+      members = [],
     } = req.body;
 
     if (!name || !start_date || !end_date) {
-      return res.status(400).json({
-        error:
-          'Необходимо указать название, дату начала и дату окончания проекта',
-      });
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'Необходимо указать название, дату начала и дату окончания проекта' });
     }
 
-    if (
-      new Date(end_date) <
-      new Date(start_date)
-    ) {
-      return res.status(400).json({
-        error:
-          'Дата окончания проекта не может быть раньше даты начала',
-      });
+    if (new Date(end_date) < new Date(start_date)) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'Дата окончания проекта не может быть раньше даты начала' });
     }
 
-    const result = await pool.query(
-      `
-        INSERT INTO projects (
-          name,
-          start_date,
-          end_date,
-          status,
-          updated_at
-        )
-        VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP)
-        RETURNING *
-      `,
-      [
-        name.trim(),
-        start_date,
-        end_date,
-        status,
-      ]
+    const result = await client.query(
+      `INSERT INTO projects (name, start_date, end_date, status, updated_at)
+       VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP)
+       RETURNING *`,
+      [name.trim(), start_date, end_date, status]
     );
 
-    res.status(201).json(result.rows[0]);
+    const project = result.rows[0];
+    const uniqueNames = [...new Set((Array.isArray(members) ? members : [])
+      .map((value) => String(value || '').trim())
+      .filter(Boolean))];
+
+    for (const memberName of uniqueNames) {
+      const userResult = await client.query(
+        'INSERT INTO users (name) VALUES ($1) RETURNING id, name',
+        [memberName]
+      );
+      await client.query(
+        'INSERT INTO project_members (project_id, user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
+        [project.id, userResult.rows[0].id]
+      );
+    }
+
+    await client.query('COMMIT');
+    res.status(201).json(project);
   } catch (err) {
-    console.error(
-      'Ошибка создания проекта:',
-      err
-    );
-
-    res.status(500).json({
-      error: err.message,
-    });
+    await client.query('ROLLBACK');
+    console.error('Ошибка создания проекта:', err);
+    res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
   }
 });
 
@@ -684,6 +785,160 @@ app.delete('/api/projects/:id', async (req, res) => {
 });
 
 // ======================================================
+// PROJECT MEMBERS
+// ======================================================
+
+app.get('/api/projects/:id/members', async (req, res) => {
+  try {
+    const projectId = Number(req.params.id);
+    if (!Number.isInteger(projectId)) return res.status(400).json({ error: 'Некорректный ID проекта' });
+    const result = await pool.query(
+      `SELECT u.id, u.name FROM project_members pm
+       JOIN users u ON u.id = pm.user_id
+       WHERE pm.project_id = $1 ORDER BY u.name, u.id`,
+      [projectId]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/projects/:id/members', async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const projectId = Number(req.params.id);
+    const name = String(req.body.name || '').trim();
+    if (!Number.isInteger(projectId)) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'Некорректный ID проекта' });
+    }
+    if (!name) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'Введите имя участника' });
+    }
+    const project = await client.query('SELECT id FROM projects WHERE id = $1', [projectId]);
+    if (!project.rows.length) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Проект не найден' });
+    }
+    const user = await client.query('INSERT INTO users (name) VALUES ($1) RETURNING id, name', [name]);
+    await client.query(
+      'INSERT INTO project_members (project_id, user_id) VALUES ($1, $2)',
+      [projectId, user.rows[0].id]
+    );
+    await client.query('COMMIT');
+    res.status(201).json(user.rows[0]);
+  } catch (err) {
+    await client.query('ROLLBACK');
+    res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.delete('/api/projects/:projectId/members/:userId', async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const projectId = Number(req.params.projectId);
+    const userId = Number(req.params.userId);
+    if (!Number.isInteger(projectId) || !Number.isInteger(userId)) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'Некорректный ID' });
+    }
+    await client.query(
+      'UPDATE tasks SET assignee_id = NULL, updated_at = CURRENT_TIMESTAMP WHERE project_id = $1 AND assignee_id = $2',
+      [projectId, userId]
+    );
+    const removed = await client.query(
+      'DELETE FROM project_members WHERE project_id = $1 AND user_id = $2 RETURNING user_id',
+      [projectId, userId]
+    );
+    if (!removed.rows.length) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Участник не найден в проекте' });
+    }
+    const memberships = await client.query('SELECT 1 FROM project_members WHERE user_id = $1 LIMIT 1', [userId]);
+    if (!memberships.rows.length) await client.query('DELETE FROM users WHERE id = $1', [userId]);
+    await client.query('COMMIT');
+    res.json({ success: true });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+// ======================================================
+// MILESTONES
+// ======================================================
+
+app.post('/api/projects/:id/milestones', async (req, res) => {
+  try {
+    const projectId = Number(req.params.id);
+    const name = String(req.body.name || '').trim();
+    const date = req.body.date;
+    if (!Number.isInteger(projectId) || !name || !date) return res.status(400).json({ error: 'Укажите название и дату контрольной точки' });
+    const project = await pool.query('SELECT start_date, end_date FROM projects WHERE id = $1', [projectId]);
+    if (!project.rows.length) return res.status(404).json({ error: 'Проект не найден' });
+    const p = project.rows[0];
+    if (new Date(date) < new Date(p.start_date) || new Date(date) > new Date(p.end_date)) {
+      return res.status(400).json({ error: 'Контрольная точка должна находиться внутри сроков проекта' });
+    }
+    const result = await pool.query(
+      `INSERT INTO milestones (project_id, name, date, updated_at)
+       VALUES ($1, $2, $3, CURRENT_TIMESTAMP)
+       RETURNING id, project_id, name, date`,
+      [projectId, name, date]
+    );
+    res.status(201).json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.put('/api/milestones/:id', async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const current = await pool.query(
+      `SELECT m.*, p.start_date AS project_start, p.end_date AS project_end
+       FROM milestones m JOIN projects p ON p.id = m.project_id WHERE m.id = $1`,
+      [id]
+    );
+    if (!current.rows.length) return res.status(404).json({ error: 'Контрольная точка не найдена' });
+    const old = current.rows[0];
+    const name = req.body.name !== undefined ? String(req.body.name || '').trim() : old.name;
+    const date = req.body.date !== undefined ? req.body.date : old.date;
+    if (!name) return res.status(400).json({ error: 'Название не может быть пустым' });
+    if (new Date(date) < new Date(old.project_start) || new Date(date) > new Date(old.project_end)) {
+      return res.status(400).json({ error: 'Контрольная точка должна находиться внутри сроков проекта' });
+    }
+    const result = await pool.query(
+      `UPDATE milestones SET name = $1, date = $2, updated_at = CURRENT_TIMESTAMP
+       WHERE id = $3 RETURNING id, project_id, name, date`,
+      [name, date, id]
+    );
+    res.json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.delete('/api/milestones/:id', async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const result = await pool.query('DELETE FROM milestones WHERE id = $1 RETURNING id', [id]);
+    if (!result.rows.length) return res.status(404).json({ error: 'Контрольная точка не найдена' });
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ======================================================
 // TASKS
 // ======================================================
 
@@ -744,14 +999,11 @@ app.post('/api/tasks', async (req, res) => {
       assignee_id !== null &&
       assignee_id !== undefined
     ) {
-      const exists = await userExists(
-        assignee_id
-      );
+      const exists = await isProjectMember(project_id, assignee_id);
 
       if (!exists) {
         return res.status(400).json({
-          error:
-            'Пользователь с таким ID не существует',
+          error: 'Ответственный должен входить в команду этого проекта',
         });
       }
     }
@@ -760,7 +1012,9 @@ app.post('/api/tasks', async (req, res) => {
     if (!allowedTaskStatuses.includes(status)) {
       return res.status(400).json({ error: 'Некорректный статус задачи' });
     }
-    const normalizedProgress = status === 'done' ? 100 : Number(progress);
+    const requestedProgress = Number(progress);
+    const normalizedStatus = status === 'done' || requestedProgress >= 100 ? 'done' : status;
+    const normalizedProgress = normalizedStatus === 'done' ? 100 : requestedProgress;
     if (!Number.isFinite(normalizedProgress) || normalizedProgress < 0 || normalizedProgress > 100) {
       return res.status(400).json({ error: 'Прогресс должен быть от 0 до 100' });
     }
@@ -775,10 +1029,11 @@ app.post('/api/tasks', async (req, res) => {
           end_date,
           status,
           progress,
+          progress_before_done,
           comments,
           updated_at
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, CURRENT_TIMESTAMP)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, CURRENT_TIMESTAMP)
         RETURNING *
       `,
       [
@@ -787,8 +1042,9 @@ app.post('/api/tasks', async (req, res) => {
         name.trim(),
         start_date,
         end_date,
-        status,
+        normalizedStatus,
         normalizedProgress,
+        normalizedStatus === 'done' ? Math.min(99, Math.max(0, requestedProgress || 0)) : normalizedProgress,
         String(comments || '').trim(),
       ]
     );
@@ -885,7 +1141,7 @@ app.put(
           ? end_date
           : oldTask.end_date;
 
-      const newStatus =
+      let newStatus =
         status !== undefined
           ? status
           : oldTask.status;
@@ -907,12 +1163,29 @@ app.put(
           ? assignee_id
           : oldTask.assignee_id;
 
-      const newProgress =
-        newStatus === 'done'
-          ? 100
-          : progress !== undefined
-            ? Number(progress)
-            : oldTask.progress;
+      let newProgress;
+      let progressBeforeDone = Number(oldTask.progress_before_done || 0);
+
+      if (progress !== undefined && Number(progress) >= 100) {
+        if (oldTask.status !== 'done' && Number(oldTask.progress) < 100) {
+          progressBeforeDone = Number(oldTask.progress || 0);
+        }
+        newStatus = 'done';
+        newProgress = 100;
+      } else if (newStatus === 'done') {
+        if (oldTask.status !== 'done' && Number(oldTask.progress) < 100) {
+          progressBeforeDone = Number(oldTask.progress || 0);
+        }
+        newProgress = 100;
+      } else if (oldTask.status === 'done' && status !== undefined && status !== 'done' && progress === undefined) {
+        newProgress = Math.min(99, Math.max(0, progressBeforeDone));
+      } else {
+        newProgress = progress !== undefined ? Number(progress) : Number(oldTask.progress || 0);
+        if (newProgress >= 100) {
+          newStatus = 'done';
+          newProgress = 100;
+        }
+      }
 
       const newComments = comments !== undefined
         ? String(comments || '').trim()
@@ -944,7 +1217,6 @@ app.put(
         'todo',
         'in_progress',
         'done',
-        'overdue',
       ];
 
       if (
@@ -976,17 +1248,12 @@ app.put(
         newAssigneeId !== null &&
         newAssigneeId !== undefined
       ) {
-        const exists = await userExists(
-          newAssigneeId,
-          client
-        );
+        const exists = await isProjectMember(oldTask.project_id, newAssigneeId, client);
 
         if (!exists) {
           await client.query('ROLLBACK');
-
           return res.status(400).json({
-            error:
-              'Пользователь с таким ID не существует',
+            error: 'Ответственный должен входить в команду этого проекта',
           });
         }
       }
@@ -1024,9 +1291,10 @@ app.put(
             status = $4,
             assignee_id = $5,
             progress = $6,
-            comments = $7,
+            progress_before_done = $7,
+            comments = $8,
             updated_at = CURRENT_TIMESTAMP
-          WHERE id = $8
+          WHERE id = $9
         `,
         [
           newName,
@@ -1035,21 +1303,17 @@ app.put(
           newStatus,
           newAssigneeId ?? null,
           newProgress,
+          progressBeforeDone,
           newComments,
           taskId,
         ]
       );
 
-      // ==========================================
-      // КАСКАДНЫЙ СДВИГ
-      // ==========================================
-
-      if (deltaDays !== 0) {
-        await shiftSuccessors(
-          taskId,
-          deltaDays,
-          client
-        );
+      // После изменения дат гарантируем, что каждая зависимая задача
+      // начинается не раньше окончания всех своих предшественников.
+      // Топологический пересчёт не сдвигает одну и ту же задачу дважды в «ромбах» зависимостей.
+      if (start_date !== undefined || end_date !== undefined) {
+        await enforceDependencySchedule(oldTask.project_id, client);
       }
 
       await client.query('COMMIT');
@@ -1295,12 +1559,15 @@ app.post(
         ]
       );
 
+      const projectId = tasksResult.rows[0].project_id;
+      await enforceDependencySchedule(projectId, client);
       await client.query('COMMIT');
 
+      const data = await getProjectData(projectId);
       res.status(201).json({
         success: true,
-        dependency:
-          result.rows[0] || null,
+        dependency: result.rows[0] || null,
+        ...data,
       });
     } catch (err) {
       await client.query('ROLLBACK');
@@ -1376,6 +1643,7 @@ app.put('/api/tasks/:id/dependencies', async (req, res) => {
       );
     }
 
+    await enforceDependencySchedule(taskResult.rows[0].project_id, client);
     await client.query('COMMIT');
     const data = await getProjectData(taskResult.rows[0].project_id);
     res.json({ success: true, message: 'Зависимости обновлены', ...data });
